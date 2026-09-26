@@ -4,6 +4,7 @@
 [![Official Metric: Macro F0.5](https://img.shields.io/badge/Macro%20F0.5-0.9612%20(96.12%25)-brightgreen.svg)]()
 [![Pairwise F0.5](https://img.shields.io/badge/Pairwise%20F0.5-0.9771%20(97.71%25)-success.svg)]()
 [![Validation Status](https://img.shields.io/badge/Official%20Validator-PASS-success.svg)]()
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 Comprehensive state-of-the-art entity resolution pipeline developed for the **Amazon ML Challenge 2026**. The task requires matching reference business entities from **Source 1** against records in **Source 2** and **Source 3** across multiple countries (India, US, France, etc.).
 
