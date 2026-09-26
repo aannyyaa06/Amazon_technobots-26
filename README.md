@@ -131,51 +131,75 @@ PASS — no blocking issues found. Safe to submit.
 ## 4. Repository Structure
 
 ```
-├── code/
-│   └── business_entity_resolution/
-│       ├── requirements.txt
-│       ├── README.md
-│       └── src/
-│           ├── blocking/                    # High-recall candidate blocking
-│           ├── features/                    # 25-dim pairwise feature engineering
-│           ├── preprocessing/               # String, legal entity & address normalization
-│           ├── models/                      # LightGBM classifier & inference
-│           ├── evaluation/                  # Official Macro F0.5 metrics
-│           ├── complete_sota_pipeline.py    # End-to-end full test streaming inference
-│           ├── run_finetuned_pipeline.py    # Finetuned inference script
-│           ├── eval_tiered_ensemble.py      # Two-stage tiered verification
-│           └── config.py                    # Configuration & file paths
+├── LICENSE                                  # MIT License
+├── README.md                                # Master guide, benchmarks & reproduction
+├── Documentation_template.md                # Completed official methodology document
 ├── student_resource/
-│   ├── Documentation_template.md
-│   ├── README.md
 │   └── utils/
-│       └── validate_submission.py           # Official competition validator
-├── output/                                  # Generated submission files
-│   ├── matching_results.tsv (101.77 MB)
-│   └── candidate_pairs.tsv  (447.35 MB)
-└── README.md
+│       └── validate_submission.py           # Official competition validator (PASS)
+├── output/                                  # Generated final submission files
+│   ├── matching_results.tsv (101.77 MB)     # Final entity matches (Leaderboard Upload)
+│   └── candidate_pairs.tsv  (447.35 MB)     # Blocking candidate set
+└── code/
+    └── business_entity_resolution/
+        ├── requirements.txt                 # Pinned dependencies
+        ├── README.md                        # Codebase documentation
+        └── src/
+            ├── complete_sota_pipeline.py    # Main reproduction script
+            ├── blocking/                    # Multi-key candidate blocking
+            ├── features/                    # 25-dim pairwise feature engineering
+            ├── preprocessing/               # String, legal entity & address normalization
+            ├── models/                      # LightGBM classifier & inference
+            ├── evaluation/                  # Official Macro F0.5 metrics
+            └── config.py                    # Configuration & file paths
 ```
 
 ---
 
-## 5. How to Reproduce
+## 5. How to Proceed: Step-by-Step Submission Guide
 
-### Environment Setup
+Follow these exact steps to verify, package, and submit your solution:
+
+### Step 1: Clone Repository & Set Up Environment
 ```bash
+git clone https://github.com/aannyyaa06/Amazon_technobots-26.git
+cd Amazon_technobots-26
 git checkout solution-sota-f05-pipeline
 cd code/business_entity_resolution
 pip install -r requirements.txt
 ```
 
-### Reproduce Full Test Set Predictions
+### Step 2: Regenerate Submissions (Optional / Verification)
+If you wish to re-run the full streaming inference pipeline from scratch:
 ```bash
 python src/complete_sota_pipeline.py
 ```
+*Note: The verified output files are already generated and placed in `output/`.*
 
-### Run Submission Sanity Checks
+### Step 3: Run the Official Validator locally
+Always certify your submission files before uploading:
 ```bash
-python ../../student_resource/utils/validate_submission.py \
-  --matching ../../output/matching_results.tsv \
-  --candidate ../../output/candidate_pairs.tsv \
-  --test-dir ../../dataset/test
+cd ../../
+python student_resource/utils/validate_submission.py \
+  --matching output/matching_results.tsv \
+  --candidate output/candidate_pairs.tsv \
+  --test-dir dataset/test
 ```
+*Ensure you see: `PASS — no blocking issues found. Safe to submit.`*
+
+### Step 4: Live Leaderboard Submission
+1. Go to the competition portal.
+2. Under **Upload Submissions**, upload:
+   - `output/matching_results.tsv` (101.77 MB).
+3. The portal will score your file on the public test split and display your **Macro F_0.5 score**.
+
+### Step 5: Final Submission Package (.zip)
+For your final team archive submission, create the required `<team_name>_submission.zip` with this exact structure:
+```bash
+zip -r Technobots-26_submission.zip output/ code/ Documentation_template.md LICENSE
+```
+This zip contains:
+1. `output/matching_results.tsv` and `output/candidate_pairs.tsv`
+2. `code/business_entity_resolution/` (complete runnable pipeline with `src/`, `README.md`, and `requirements.txt`)
+3. `Documentation_template.md` (filled methodology writeup)
+4. `LICENSE` (MIT License)
