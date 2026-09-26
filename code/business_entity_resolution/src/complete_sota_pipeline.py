@@ -1,50 +1,139 @@
 import sys
-import gc
-import re
-import time
-import subprocess
 from pathlib import Path
-from collections import defaultdict
-import numpy as np
+sys.path.insert(0, r'd:\amazon challenge\business-entity-resolution\code\business_entity_resolution')
 import pandas as pd
+import numpy as np
+import re
+from collections import defaultdict
 import lightgbm as lgb
 from rapidfuzz import fuzz
-
-pkg_dir = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(pkg_dir))
+import gc
+import os
+import time
 
 from src.config import (
     TRAIN_S1, TRAIN_S2, TRAIN_S3, TRAIN_GT,
     TEST_S1, TEST_S2, TEST_S3,
     OUTPUT_MATCHING, OUTPUT_CANDIDATE,
-    VALIDATE_SCRIPT, TEST_DIR,
-    RANDOM_STATE, LGBM_PARAMS
+    RANDOM_STATE
 )
-from src.preprocessing.normalize import normalize_name, normalize_address, extract_numbers
-from src.evaluation.metrics import compute_macro_f05
 
-STOPWORDS = {
-    'the', 'and', 'inc', 'corp', 'corporation', 'llc', 'ltd', 'limited',
-    'pvt', 'co', 'company', 'services', 'service', 'group', 'enterprises',
-    'enterprise', 'technologies', 'technology', 'india', 'us', 'usa', 'france',
-    'rd', 'road', 'st', 'street', 'ave', 'avenue', 'nagar', 'bldg', 'floor',
-    'com', 'net', 'org', 'www'
+# -----------------------------------------------------------------------------
+# 1. DEEP PREPROCESSING & NORMALIZATION
+# -----------------------------------------------------------------------------
+LEGAL_TERMS = {
+    'pvt', 'ltd', 'limited', 'private', 'inc', 'incorporated', 'corp', 'corporation',
+    'llc', 'llp', 'co', 'company', 'cie', 'services', 'service', 'solutions', 'solution',
+    'group', 'holdings', 'holding', 'enterprises', 'enterprise', 'industries', 'industry',
+    'technologies', 'technology', 'associates', 'associate', 'partners', 'partner',
+    'sarl', 'sas', 'sasu', 'eurl', 'gmbh', 'sa', 'ag', 'bv', 'nv', 'shri', 'brothers',
+    'm/s', 'dr', 'mr', 'trading', 'traders', 'agency', 'agencies', 'center', 'centre'
 }
 
+CITY_ALIASES = {
+    'bengaluru': 'bangalore',
+    'mumbai': 'bombay',
+    'kolkata': 'calcutta',
+    'chennai': 'madras',
+    'varanasi': 'banaras',
+    'prayagraj': 'allahabad',
+    'gurugram': 'gurgaon',
+    'puducherry': 'pondicherry',
+    'kochi': 'cochin',
+    'thiruvananthapuram': 'trivandrum',
+    'vadodara': 'baroda',
+    'vijayawada': 'bezawada',
+    'mysuru': 'mysore',
+    'visakhapatnam': 'vizag'
+}
 
-def clean_tokens(text: str, min_len: int = 3) -> set:
+STREET_ALIASES = {
+    'rd': 'road', 'st': 'street', 'ave': 'avenue', 'blvd': 'boulevard',
+    'dr': 'drive', 'ln': 'lane', 'hwy': 'highway', 'pkway': 'parkway',
+    'pkwy': 'parkway', 'ct': 'court', 'pl': 'place', 'sq': 'square',
+    'bldg': 'building', 'fl': 'floor', 'flr': 'floor', 'apt': 'apartment',
+    'ste': 'suite', 'dept': 'department', 'dist': 'district', 'sec': 'sector',
+    'nagar': 'nagar', 'marg': 'marg', 'gali': 'gali', 'chowk': 'chowk',
+    'r': 'rue', 'av': 'avenue', 'bd': 'boulevard', 'pl': 'place'
+}
+
+def clean_text_advanced(text: str) -> str:
+    if not text or pd.isna(text):
+        return ""
+    t = str(text).lower()
+    t = re.sub(r'[\r\n\t]+', ' ', t)
+    t = re.sub(r'https?://\S+|www\.\S+', ' ', t)
+    t = re.sub(r'\.(com|net|org|in|us|fr|co|gov|edu)\b', ' ', t)
+    t = re.sub(r'[^a-z0-9\s]', ' ', t)
+    t = re.sub(r'\s+', ' ', t).strip()
+    return t
+
+def normalize_business_name_deep(name: str) -> str:
+    cleaned = clean_text_advanced(name)
+    if not cleaned:
+        return ""
+    tokens = cleaned.split()
+    filtered = [t for t in tokens if t not in LEGAL_TERMS and len(t) > 1]
+    if not filtered:
+        filtered = tokens
+    return " ".join(filtered)
+
+def normalize_address_deep(addr: str) -> str:
+    cleaned = clean_text_advanced(addr)
+    if not cleaned:
+        return ""
+    tokens = cleaned.split()
+    res = []
+    for t in tokens:
+        if t in CITY_ALIASES:
+            res.append(CITY_ALIASES[t])
+        elif t in STREET_ALIASES:
+            res.append(STREET_ALIASES[t])
+        else:
+            res.append(t)
+    return " ".join(res)
+
+def extract_digits(text: str) -> set:
     if not text:
         return set()
-    cleaned = re.sub(r'\.(com|net|org|in|us|fr|co)', ' ', text.lower())
-    tokens = re.findall(r'[a-z0-9]{' + str(min_len) + r',}', cleaned)
-    return set(t for t in tokens if t not in STOPWORDS)
+    return set(re.findall(r'\b\d+\b', text))
 
+def extract_pin_or_zip(addr: str, country: str) -> str:
+    if not addr:
+        return ""
+    if country == 'India':
+        m = re.findall(r'\b[1-9]\d{5}\b', addr)
+        return m[-1] if m else ""
+    elif country == 'US':
+        m = re.findall(r'\b\d{5}\b', addr)
+        return m[-1] if m else ""
+    elif country == 'France':
+        m = re.findall(r'\b\d{5}\b', addr)
+        return m[0] if m else ""
+    return ""
 
-def compute_fast_features(s1_name, s1_addr, c_name, c_addr, s1_country, c_country, c_src):
-    s1_ntoks = clean_tokens(s1_name, 3)
-    c_ntoks = clean_tokens(c_name, 3)
-    s1_atoks = clean_tokens(s1_addr, 3)
-    c_atoks = clean_tokens(c_addr, 3)
+def clean_tokens_set(text: str, min_len: int = 3) -> set:
+    if not text:
+        return set()
+    return set(t for t in text.split() if len(t) >= min_len and t not in LEGAL_TERMS)
+
+# -----------------------------------------------------------------------------
+# 2. PAIRWISE FEATURE EXTRACTION
+# -----------------------------------------------------------------------------
+FEATURE_NAMES = [
+    'name_exact', 'name_ratio', 'name_token_sort', 'name_token_set',
+    'name_jaccard', 'name_overlap', 'name_len_diff', 'name_tok_diff',
+    'addr_exact', 'addr_ratio', 'addr_token_set', 'addr_jaccard',
+    'addr_overlap', 'addr_len_diff', 'shared_numbers', 'has_same_num',
+    'same_country', 'is_s2', 'name_addr_mean', 'has_high_name', 'has_high_addr',
+    'same_postal_code', 'postal_mismatch', 'char_3gram_jaccard', 'exact_prefix5'
+]
+
+def compute_pairwise_features(s1_name, s1_addr, c_name, c_addr, s1_country, c_country, c_src):
+    s1_ntoks = clean_tokens_set(s1_name, 3)
+    c_ntoks = clean_tokens_set(c_name, 3)
+    s1_atoks = clean_tokens_set(s1_addr, 3)
+    c_atoks = clean_tokens_set(c_addr, 3)
 
     n_inter = len(s1_ntoks & c_ntoks)
     n_union = len(s1_ntoks | c_ntoks)
@@ -65,10 +154,24 @@ def compute_fast_features(s1_name, s1_addr, c_name, c_addr, s1_country, c_countr
     addr_token_set = fuzz.token_set_ratio(s1_addr, c_addr) / 100.0 if s1_addr and c_addr else 0.0
     addr_ratio = fuzz.ratio(s1_addr, c_addr) / 100.0 if s1_addr and c_addr else 0.0
 
-    s1_nums = extract_numbers(s1_addr)
-    c_nums = extract_numbers(c_addr)
+    s1_nums = extract_digits(s1_addr)
+    c_nums = extract_digits(c_addr)
     shared_nums = len(s1_nums & c_nums)
     has_same_num = 1.0 if shared_nums > 0 else 0.0
+
+    post1 = extract_pin_or_zip(s1_addr, s1_country)
+    post2 = extract_pin_or_zip(c_addr, c_country)
+    same_postal = 1.0 if (post1 and post2 and post1 == post2) else 0.0
+    postal_mismatch = 1.0 if (post1 and post2 and post1 != post2) else 0.0
+
+    comp1 = re.sub(r'[^a-z0-9]', '', s1_name)
+    comp2 = re.sub(r'[^a-z0-9]', '', c_name)
+    ng1 = set(comp1[i:i+3] for i in range(len(comp1)-2)) if len(comp1) >= 3 else set()
+    ng2 = set(comp2[i:i+3] for i in range(len(comp2)-2)) if len(comp2) >= 3 else set()
+    ng_union = len(ng1 | ng2)
+    ng_jaccard = len(ng1 & ng2) / ng_union if ng_union > 0 else 0.0
+
+    exact_prefix5 = 1.0 if (len(comp1) >= 5 and len(comp2) >= 5 and comp1[:5] == comp2[:5]) else 0.0
 
     return [
         1.0 if s1_name == c_name and s1_name else 0.0,
@@ -77,117 +180,32 @@ def compute_fast_features(s1_name, s1_addr, c_name, c_addr, s1_country, c_countr
         name_token_set,
         name_jaccard,
         name_overlap,
-        abs(len(s1_name) - len(c_name)),
-        abs(len(s1_ntoks) - len(c_ntoks)),
+        abs(len(s1_name) - len(c_name)) / max(len(s1_name), len(c_name), 1),
+        abs(len(s1_ntoks) - len(c_ntoks)) / max(len(s1_ntoks), len(c_ntoks), 1),
         1.0 if s1_addr == c_addr and s1_addr else 0.0,
         addr_ratio,
         addr_token_set,
         addr_jaccard,
         addr_overlap,
-        abs(len(s1_addr) - len(c_addr)),
+        abs(len(s1_addr) - len(c_addr)) / max(len(s1_addr), len(c_addr), 1),
         float(shared_nums),
         has_same_num,
         1.0 if s1_country == c_country else 0.0,
         1.0 if c_src == 'S2' else 0.0,
-        0.5 * (name_ratio + addr_ratio),
+        (name_token_set + addr_token_set) / 2.0,
         1.0 if name_token_set >= 0.85 else 0.0,
-        1.0 if addr_token_set >= 0.85 else 0.0
+        1.0 if addr_token_set >= 0.85 else 0.0,
+        same_postal,
+        postal_mismatch,
+        ng_jaccard,
+        exact_prefix5
     ]
 
-
-FEATURE_NAMES = [
-    'name_exact', 'name_ratio', 'name_token_sort', 'name_token_set',
-    'name_jaccard', 'name_overlap', 'name_len_diff', 'name_tok_diff',
-    'addr_exact', 'addr_ratio', 'addr_token_set', 'addr_jaccard',
-    'addr_overlap', 'addr_len_diff', 'shared_numbers', 'has_same_num',
-    'same_country', 'is_s2', 'name_addr_mean', 'has_high_name', 'has_high_addr'
-]
-
-
-class SOTAUltraBlocker:
-    def __init__(self, max_candidates_per_key: int = 50):
-        self.max_candidates_per_key = max_candidates_per_key
-        self.exact_name_idx = defaultdict(lambda: defaultdict(list))
-        self.compact_name_idx = defaultdict(lambda: defaultdict(list))
-        self.token_idx = defaultdict(lambda: defaultdict(list))
-        self.exact_addr_idx = defaultdict(lambda: defaultdict(list))
-        self.addr_combo_idx = defaultdict(lambda: defaultdict(list))
-
-    def fit(self, cand_df: pd.DataFrame, desc: str = "Test Candidates"):
-        total = len(cand_df)
-        step = max(1, total // 10)
-        print(f"Indexing {total:,} {desc} into SOTA Multi-Blocker...", flush=True)
-        for i, row in enumerate(cand_df.itertuples(index=False)):
-            if (i + 1) % step == 0 or (i + 1) == total:
-                pct = ((i + 1) / total) * 100
-                print(f"[{desc.upper()} INDEXING] {pct:.1f}% ({i + 1:,} / {total:,})", flush=True)
-
-            cid = row.entity_id
-            country = row.country
-            name = row.business_name_norm
-            addr = row.business_address_norm
-
-            if name:
-                self.exact_name_idx[country][name].append(cid)
-                compact = re.sub(r'[^a-z0-9]', '', name)
-                if len(compact) >= 5:
-                    self.compact_name_idx[country][compact].append(cid)
-
-                toks = clean_tokens(name, min_len=3)
-                for tok in list(toks)[:2]:
-                    self.token_idx[country][tok].append(cid)
-
-            if addr:
-                self.exact_addr_idx[country][addr].append(cid)
-                nums = extract_numbers(addr)
-                atoks = clean_tokens(addr, min_len=4)
-                if nums and atoks:
-                    for num in list(nums)[:1]:
-                        for atok in list(atoks)[:1]:
-                            self.addr_combo_idx[country][f"{num}_{atok}"].append(cid)
-
-    def get_candidates(self, country: str, name: str, addr: str, max_cands: int = 40) -> list:
-        cands = set()
-        if name:
-            cands.update(self.exact_name_idx[country].get(name, [])[:self.max_candidates_per_key])
-            compact = re.sub(r'[^a-z0-9]', '', name)
-            if len(compact) >= 5:
-                cands.update(self.compact_name_idx[country].get(compact, [])[:self.max_candidates_per_key])
-            toks = clean_tokens(name, min_len=3)
-            for tok in list(toks)[:2]:
-                if len(cands) >= max_cands:
-                    break
-                m = self.token_idx[country].get(tok, [])
-                if len(m) <= self.max_candidates_per_key:
-                    cands.update(m)
-
-        if addr and len(cands) < max_cands:
-            cands.update(self.exact_addr_idx[country].get(addr, [])[:self.max_candidates_per_key])
-            nums = extract_numbers(addr)
-            atoks = clean_tokens(addr, min_len=4)
-            if nums and atoks:
-                for num in list(nums)[:1]:
-                    for atok in list(atoks)[:1]:
-                        m = self.addr_combo_idx[country].get(f"{num}_{atok}", [])
-                        if len(m) <= 30:
-                            cands.update(m)
-                        if len(cands) >= max_cands:
-                            break
-
-        cand_list = list(cands)
-        return cand_list[:max_cands] if len(cand_list) > max_cands else cand_list
-
-
-def run_complete_sota_pipeline():
-    t_start = time.time()
-    print("=" * 80, flush=True)
-    print("STARTING COMPLETE SOTA HYBRID PIPELINE EXECUTION", flush=True)
-    print("=" * 80, flush=True)
-
-    # ----------------------------------------------------
-    # PHASE 1 & 2: DATA & MODEL CALIBRATION
-    # ----------------------------------------------------
-    print("\n[STAGE 1/4] Training Model & Calibrating Decision Threshold...", flush=True)
+# -----------------------------------------------------------------------------
+# 3. TRAINING & CALIBRATION ENGINE
+# -----------------------------------------------------------------------------
+def train_high_precision_model():
+    print("[1/4] Training High-Precision LightGBM Model with Preprocessed Data...")
     gt_df = pd.read_csv(TRAIN_GT, sep='\t', keep_default_na=False)
     s1_df = pd.read_csv(TRAIN_S1, sep='\t', keep_default_na=False)
 
@@ -198,8 +216,8 @@ def run_complete_sota_pipeline():
 
     eval_s1_ids = set(sampled_gt['source1_entity_id'])
     s1_sub = s1_df[s1_df.entity_id.isin(eval_s1_ids)].copy()
-    s1_sub['business_name_norm'] = s1_sub['business_name'].apply(normalize_name)
-    s1_sub['business_address_norm'] = s1_sub['business_address'].apply(normalize_address)
+    s1_sub['name_norm'] = s1_sub['business_name'].apply(normalize_business_name_deep)
+    s1_sub['addr_norm'] = s1_sub['business_address'].apply(normalize_address_deep)
 
     gt_map = {}
     all_true = set()
@@ -214,280 +232,242 @@ def run_complete_sota_pipeline():
             gt_map[sid] = set()
 
     countries = set(s1_sub.country.unique())
-    print(f"Countries: {countries} | True targets: {len(all_true):,}", flush=True)
-
     s2 = pd.read_csv(TRAIN_S2, sep='\t', keep_default_na=False)
     s3 = pd.read_csv(TRAIN_S3, sep='\t', keep_default_na=False)
     s2 = s2[s2.country.isin(countries)]
     s3 = s3[s3.country.isin(countries)]
 
     s2_pos = s2[s2.entity_id.isin(all_true)]
-    s2_neg = s2[~s2.entity_id.isin(all_true)].sample(min(120000, len(s2)), random_state=RANDOM_STATE)
+    s2_neg = s2[~s2.entity_id.isin(all_true)].sample(min(80000, len(s2)), random_state=RANDOM_STATE)
     s2_pool = pd.concat([s2_pos, s2_neg]).drop_duplicates('entity_id')
 
     s3_pos = s3[s3.entity_id.isin(all_true)]
-    s3_neg = s3[~s3.entity_id.isin(all_true)].sample(min(120000, len(s3)), random_state=RANDOM_STATE)
+    s3_neg = s3[~s3.entity_id.isin(all_true)].sample(min(80000, len(s3)), random_state=RANDOM_STATE)
     s3_pool = pd.concat([s3_pos, s3_neg]).drop_duplicates('entity_id')
 
-    s2_pool['business_name_norm'] = s2_pool['business_name'].apply(normalize_name)
-    s2_pool['business_address_norm'] = s2_pool['business_address'].apply(normalize_address)
-    s3_pool['business_name_norm'] = s3_pool['business_name'].apply(normalize_name)
-    s3_pool['business_address_norm'] = s3_pool['business_address'].apply(normalize_address)
+    s2_pool['name_norm'] = s2_pool['business_name'].apply(normalize_business_name_deep)
+    s2_pool['addr_norm'] = s2_pool['business_address'].apply(normalize_address_deep)
+    s3_pool['name_norm'] = s3_pool['business_name'].apply(normalize_business_name_deep)
+    s3_pool['addr_norm'] = s3_pool['business_address'].apply(normalize_address_deep)
 
     cand_pool = pd.concat([s2_pool, s3_pool], ignore_index=True)
-    del s2, s3, s2_pool, s3_pool
-    gc.collect()
+    del s2, s3, s2_pos, s2_neg, s3_pos, s3_neg; gc.collect()
 
-    train_blocker = SOTAUltraBlocker(max_candidates_per_key=50)
-    train_blocker.fit(cand_pool, desc="Training Candidates")
-
+    exact_name_idx = defaultdict(lambda: defaultdict(list))
+    compact_name_idx = defaultdict(lambda: defaultdict(list))
+    token_idx = defaultdict(lambda: defaultdict(list))
+    prefix_idx = defaultdict(lambda: defaultdict(list))
     cand_lookup = {}
-    for r in cand_pool.itertuples(index=False):
-        cand_lookup[r.entity_id] = (
-            r.business_name_norm, r.business_address_norm, r.country,
-            'S2' if r.entity_id.startswith('S2-') else 'S3'
-        )
 
-    val_s1_ids = list(eval_s1_ids)[:7000]
-    val_s1_set = set(val_s1_ids)
+    for r in cand_pool.itertuples(index=False):
+        cid = r.entity_id
+        c = r.country
+        n = r.name_norm
+        a = r.addr_norm
+        cand_lookup[cid] = (n, a, c, 'S2' if cid.startswith('S2-') else 'S3')
+
+        if n:
+            exact_name_idx[c][n].append(cid)
+            comp = re.sub(r'[^a-z0-9]', '', n)
+            if len(comp) >= 4:
+                compact_name_idx[c][comp].append(cid)
+                prefix_idx[c][comp[:5]].append(cid)
+            toks = clean_tokens_set(n, 3)
+            for t in toks:
+                token_idx[c][t].append(cid)
 
     X_train, y_train = [], []
-    X_val, y_val = [], []
-    val_pairs = []
+    for r in s1_sub.itertuples(index=False):
+        sid = r.entity_id
+        c = r.country
+        n = r.name_norm
+        comp = re.sub(r'[^a-z0-9]', '', n)
+        true_set = gt_map.get(sid, set())
 
-    recovered_val_true = 0
-    total_val_true = sum(len(gt_map[s]) for s in val_s1_set)
+        cands = set()
+        if n: cands.update(exact_name_idx[c].get(n, [])[:40])
+        if len(comp) >= 4 and len(cands) < 50:
+            cands.update(compact_name_idx[c].get(comp, [])[:40])
+        for t in clean_tokens_set(n, 3):
+            if len(cands) >= 50: break
+            m = token_idx[c].get(t, [])
+            if len(m) <= 40: cands.update(m)
+        if len(comp) >= 5 and len(cands) < 50:
+            m = prefix_idx[c].get(comp[:5], [])
+            if len(m) <= 30: cands.update(m)
 
-    total_s1 = len(s1_sub)
-    step = max(1, total_s1 // 10)
-    print(f"\n[PROGRESS] Generating Candidate Pairs & Features for {total_s1:,} entities...", flush=True)
-
-    for i, s1_row in enumerate(s1_sub.itertuples(index=False)):
-        if (i + 1) % step == 0 or (i + 1) == total_s1:
-            pct = ((i + 1) / total_s1) * 100
-            print(f"[CALIBRATION FEATURES] {pct:.1f}% ({i + 1:,} / {total_s1:,})", flush=True)
-
-        s1_id = s1_row.entity_id
-        country = s1_row.country
-        name = s1_row.business_name_norm
-        addr = s1_row.business_address_norm
-
-        cands = train_blocker.get_candidates(country, name, addr, max_cands=40)
-        true_set = gt_map.get(s1_id, set())
-
-        is_val = s1_id in val_s1_set
-        if is_val:
-            recovered_val_true += len(true_set & set(cands))
-
-        for cid in cands:
+        for cid in list(cands)[:50]:
             cinfo = cand_lookup.get(cid)
             if not cinfo: continue
-            cname, caddr, ccountry, csrc = cinfo
-            feats = compute_fast_features(name, addr, cname, caddr, country, ccountry, csrc)
-            label = 1 if cid in true_set else 0
+            cn, ca, cc, csrc = cinfo
+            feats = compute_pairwise_features(n, r.addr_norm, cn, ca, c, cc, csrc)
+            X_train.append(feats)
+            y_train.append(1 if cid in true_set else 0)
 
-            if is_val:
-                X_val.append(feats)
-                y_val.append(label)
-                val_pairs.append((s1_id, cid))
-            else:
-                X_train.append(feats)
-                y_train.append(label)
-
-    recall = recovered_val_true / total_val_true if total_val_true > 0 else 0
-    print(f"\n[BLOCKING RECALL (Validation)]: {recall:.2%} ({recovered_val_true:,} / {total_val_true:,})", flush=True)
-
-    X_tr = pd.DataFrame(X_train, columns=FEATURE_NAMES)
-    y_tr = np.array(y_train)
-    X_v = pd.DataFrame(X_val, columns=FEATURE_NAMES)
-    y_v = np.array(y_val)
-
-    print(f"\nFitting LightGBM on {len(X_tr):,} candidate pairs (Positives: {y_tr.sum():,})...", flush=True)
-    clf = lgb.LGBMClassifier(**LGBM_PARAMS)
-    clf.fit(X_tr, y_tr, eval_set=[(X_v, y_v)], callbacks=[lgb.early_stopping(50, verbose=False)])
-
-    probs = clf.predict_proba(X_v)[:, 1]
-
-    print("\n" + "=" * 70, flush=True)
-    print("THRESHOLD OPTIMIZATION RESULTS:", flush=True)
-    print("=" * 70, flush=True)
-    best_th = 0.70
-    best_f05 = -1
-
-    for th in [0.40, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]:
-        pred_map = defaultdict(set)
-        for (sid, cid), p in zip(val_pairs, probs):
-            if p >= th:
-                pred_map[sid].add(cid)
-        res = compute_macro_f05(gt_map, pred_map, val_s1_ids)
-        print(f"Threshold {th:.2f} | Macro F0.5 = {res['macro_f05']:.4f} | Zero-Match F0.5 = {res['zero_match_f05']:.4f}", flush=True)
-        if res['macro_f05'] > best_f05:
-            best_f05 = res['macro_f05']
-            best_th = th
-
-    print("=" * 70, flush=True)
-    print(f"OPTIMAL CALIBRATED THRESHOLD: {best_th:.2f} -> MACRO F0.5 = {best_f05:.4f}", flush=True)
-    print("=" * 70, flush=True)
-
-    del X_train, y_train, X_val, y_val, X_tr, y_tr, X_v, y_v, cand_pool, train_blocker, cand_lookup
-    gc.collect()
-
-    # ----------------------------------------------------
-    # PHASE 3: TEST CANDIDATE INDEXING
-    # ----------------------------------------------------
-    print("\n[STAGE 2/4] Loading and Normalizing Test Candidates (S2 & S3)...", flush=True)
-    s2_reader = pd.read_csv(TEST_S2, sep='\t', keep_default_na=False, chunksize=1000000)
-    s3_reader = pd.read_csv(TEST_S3, sep='\t', keep_default_na=False, chunksize=1000000)
-
-    s2_chunks = []
-    print("Reading and normalizing test_source2.tsv in chunks...", flush=True)
-    for i, chunk in enumerate(s2_reader):
-        chunk['business_name_norm'] = chunk['business_name'].str.lower().str.replace('&', ' and ')
-        chunk['business_address_norm'] = chunk['business_address'].str.lower().str.replace('&', ' and ')
-        s2_chunks.append(chunk)
-        print(f"  test_source2 chunk {i+1} loaded (1M records)", flush=True)
-
-    s3_chunks = []
-    print("Reading and normalizing test_source3.tsv in chunks...", flush=True)
-    for i, chunk in enumerate(s3_reader):
-        chunk['business_name_norm'] = chunk['business_name'].str.lower().str.replace('&', ' and ')
-        chunk['business_address_norm'] = chunk['business_address'].str.lower().str.replace('&', ' and ')
-        s3_chunks.append(chunk)
-        print(f"  test_source3 chunk {i+1} loaded (1M records)", flush=True)
-
-    test_cand_df = pd.concat(s2_chunks + s3_chunks, ignore_index=True)
-    del s2_chunks, s3_chunks
-    gc.collect()
-
-    print(f"Total Test Candidate Pool: {len(test_cand_df):,} records", flush=True)
-
-    test_blocker = SOTAUltraBlocker(max_candidates_per_key=50)
-    test_blocker.fit(test_cand_df, desc="Test Candidates")
-
-    test_cand_lookup = {}
-    print("Building fast candidate lookup table...", flush=True)
-    for r in test_cand_df.itertuples(index=False):
-        test_cand_lookup[r.entity_id] = (
-            r.business_name_norm, r.business_address_norm, r.country,
-            'S2' if r.entity_id.startswith('S2-') else 'S3'
-        )
-
-    del test_cand_df
-    gc.collect()
-
-    # ----------------------------------------------------
-    # PHASE 4: FULL TEST SCORING & FILE GENERATION
-    # ----------------------------------------------------
-    print("\n[STAGE 3/4] Streaming Test S1 (1,732,544 Entities) with Live Progress...", flush=True)
-    total_test_s1 = 1732544
-    chunk_size = 200000
-
-    s1_reader = pd.read_csv(
-        TEST_S1, sep='\t', keep_default_na=False, chunksize=chunk_size
+    clf = lgb.LGBMClassifier(
+        objective='binary',
+        boosting_type='gbdt',
+        learning_rate=0.04,
+        num_leaves=150,
+        max_depth=10,
+        min_child_samples=30,
+        feature_fraction=0.85,
+        bagging_fraction=0.85,
+        bagging_freq=1,
+        n_estimators=450,
+        random_state=RANDOM_STATE,
+        verbose=-1,
+        n_jobs=-1
     )
+    clf.fit(pd.DataFrame(X_train, columns=FEATURE_NAMES), np.array(y_train))
+    print(f"Model trained successfully on {len(X_train):,} pairs.")
+    return clf
 
-    OUTPUT_MATCHING.parent.mkdir(parents=True, exist_ok=True)
-    with open(OUTPUT_MATCHING, 'w', encoding='utf-8') as f_m:
-        f_m.write("source1_entity_id\tmatched_entity_ids\n")
-    with open(OUTPUT_CANDIDATE, 'w', encoding='utf-8') as f_c:
-        f_c.write("source1_entity_id\tcandidate_entity_ids\n")
+# -----------------------------------------------------------------------------
+# 4. STREAMING TEST INFERENCE WITH 1-TO-1 COMPETITIVE ASSIGNMENT
+# -----------------------------------------------------------------------------
+def run_sota_test_pipeline(clf, high_th=0.68):
+    print("[2/4] Building High-Recall Index for Test Candidate Pool (S2 + S3)...")
+    t0 = time.time()
 
-    total_processed = 0
-    total_matches = 0
-    total_candidates = 0
+    exact_name_idx = defaultdict(lambda: defaultdict(list))
+    compact_name_idx = defaultdict(lambda: defaultdict(list))
+    token_idx = defaultdict(lambda: defaultdict(list))
+    prefix_idx = defaultdict(lambda: defaultdict(list))
+    cand_lookup = {}
 
-    chunk_idx = 0
-    for chunk in s1_reader:
-        chunk_idx += 1
-        t_c0 = time.time()
-        chunk['business_name_norm'] = chunk['business_name'].str.lower().str.replace('&', ' and ')
-        chunk['business_address_norm'] = chunk['business_address'].str.lower().str.replace('&', ' and ')
+    def index_source(path, prefix):
+        print(f"  Indexing {prefix} from {path}...")
+        for chunk in pd.read_csv(path, sep='\t', chunksize=250000, keep_default_na=False):
+            chunk['name_norm'] = chunk['business_name'].apply(normalize_business_name_deep)
+            chunk['addr_norm'] = chunk['business_address'].apply(normalize_address_deep)
+            for r in chunk.itertuples(index=False):
+                cid = r.entity_id
+                c = r.country
+                n = r.name_norm
+                a = r.addr_norm
+                cand_lookup[cid] = (n, a, c, prefix)
+                if n:
+                    exact_name_idx[c][n].append(cid)
+                    comp = re.sub(r'[^a-z0-9]', '', n)
+                    if len(comp) >= 4:
+                        compact_name_idx[c][comp].append(cid)
+                        prefix_idx[c][comp[:5]].append(cid)
+                    toks = clean_tokens_set(n, 3)
+                    for t in toks:
+                        token_idx[c][t].append(cid)
 
-        m_lines = []
-        c_lines = []
+    index_source(TEST_S2, 'S2')
+    index_source(TEST_S3, 'S3')
+    print(f"Indexed {len(cand_lookup):,} candidate records in {time.time()-t0:.1f}s.")
 
-        all_batch_pairs = []
-        batch_slice_map = []
+    print(f"[3/4] Streaming Test Source 1 & Scoring Candidates...")
+    t_stream = time.time()
+    Path(OUTPUT_MATCHING).parent.mkdir(parents=True, exist_ok=True)
 
-        for row in chunk.itertuples(index=False):
-            s1_id = row.entity_id
-            country = row.country
-            name = row.business_name_norm
-            addr = row.business_address_norm
+    # In streaming mode with 1-to-1 competitive assignment:
+    # We maintain target_assigned_best: cid -> (s1_id, max_prob)
+    # To handle scale efficiently across chunks, we store matches per chunk,
+    # and write candidate pairs directly.
+    cand_f = open(OUTPUT_CANDIDATE, 'w', encoding='utf-8')
+    cand_f.write("source1_entity_id\tcandidate_entity_ids\n")
 
-            cands = test_blocker.get_candidates(country, name, addr, max_cands=35)
-            c_lines.append(f"{s1_id}\t{','.join(cands)}\n")
-            total_candidates += len(cands)
+    # In-memory predicted matches: sid -> list of (cid, prob)
+    predictions_map = defaultdict(list)
+    s1_all_ids = []
 
-            if not cands:
-                batch_slice_map.append((s1_id, 0, 0, []))
-                continue
+    chunk_size = 100000
+    processed = 0
 
-            start_idx = len(all_batch_pairs)
-            valid_cids = []
-            for cid in cands:
-                cinfo = test_cand_lookup.get(cid)
+    for s1_chunk in pd.read_csv(TEST_S1, sep='\t', chunksize=chunk_size, keep_default_na=False):
+        s1_chunk['name_norm'] = s1_chunk['business_name'].apply(normalize_business_name_deep)
+        s1_chunk['addr_norm'] = s1_chunk['business_address'].apply(normalize_address_deep)
+
+        chunk_pairs = []
+        chunk_feats = []
+
+        for r in s1_chunk.itertuples(index=False):
+            sid = r.entity_id
+            s1_all_ids.append(sid)
+            c = r.country
+            n = r.name_norm
+            a = r.addr_norm
+            comp = re.sub(r'[^a-z0-9]', '', n)
+
+            cands = set()
+            if n: cands.update(exact_name_idx[c].get(n, [])[:45])
+            if len(comp) >= 4 and len(cands) < 50:
+                cands.update(compact_name_idx[c].get(comp, [])[:45])
+            for t in clean_tokens_set(n, 3):
+                if len(cands) >= 50: break
+                m = token_idx[c].get(t, [])
+                if len(m) <= 40: cands.update(m)
+            if len(comp) >= 5 and len(cands) < 50:
+                m = prefix_idx[c].get(comp[:5], [])
+                if len(m) <= 30: cands.update(m)
+
+            cand_list = list(cands)[:50]
+            cand_str = ",".join(cand_list) if cand_list else ""
+            cand_f.write(f"{sid}\t{cand_str}\n")
+
+            for cid in cand_list:
+                cinfo = cand_lookup.get(cid)
                 if not cinfo: continue
-                cname, caddr, ccountry, csrc = cinfo
-                feats = compute_fast_features(name, addr, cname, caddr, country, ccountry, csrc)
-                all_batch_pairs.append(feats)
-                valid_cids.append(cid)
+                cn, ca, cc, csrc = cinfo
+                feats = compute_pairwise_features(n, a, cn, ca, c, cc, csrc)
+                chunk_pairs.append((sid, cid))
+                chunk_feats.append(feats)
 
-            end_idx = len(all_batch_pairs)
-            batch_slice_map.append((s1_id, start_idx, end_idx, valid_cids))
+        if chunk_feats:
+            X_df = pd.DataFrame(chunk_feats, columns=FEATURE_NAMES)
+            probs = clf.predict_proba(X_df)[:, 1]
+            for (sid, cid), prob in zip(chunk_pairs, probs):
+                if prob >= high_th:
+                    predictions_map[sid].append((cid, prob))
 
-        if all_batch_pairs:
-            X_batch = pd.DataFrame(all_batch_pairs, columns=FEATURE_NAMES)
-            batch_probs = clf.predict_proba(X_batch)[:, 1]
+        processed += len(s1_chunk)
+        print(f"  Processed {processed:,} / 1,732,544 test entities ({time.time()-t_stream:.1f}s)...")
 
-            for s1_id, start, end, cids in batch_slice_map:
-                if start == end:
-                    m_lines.append(f"{s1_id}\t\n")
-                else:
-                    pair_probs = batch_probs[start:end]
-                    selected = [cid for cid, p in zip(cids, pair_probs) if p >= best_th]
-                    uniq_selected = list(dict.fromkeys(selected))
-                    m_lines.append(f"{s1_id}\t{','.join(uniq_selected)}\n")
-                    total_matches += len(uniq_selected)
-        else:
-            for s1_id, _, _, _ in batch_slice_map:
-                m_lines.append(f"{s1_id}\t\n")
+    cand_f.close()
+    print("Candidate pairs written successfully.")
 
-        with open(OUTPUT_MATCHING, 'a', encoding='utf-8') as f_m:
-            f_m.writelines(m_lines)
-        with open(OUTPUT_CANDIDATE, 'a', encoding='utf-8') as f_c:
-            f_c.writelines(c_lines)
+    print("[4/4] Applying Global 1-to-1 Competitive Assignment & Writing Matches...")
+    # Flat list of all high-confidence predicted pairs: (prob, sid, cid)
+    all_pairs = []
+    for sid, matches in predictions_map.items():
+        for cid, prob in matches:
+            all_pairs.append((prob, sid, cid))
 
-        total_processed += len(chunk)
-        pct = (total_processed / total_test_s1) * 100
-        print(f"[TEST INFERENCE PROGRESS] {pct:.1f}% ({total_processed:,} / {total_test_s1:,} S1 entities processed in {time.time() - t_c0:.1f}s)", flush=True)
+    # Sort globally by probability descending
+    all_pairs.sort(key=lambda x: x[0], reverse=True)
 
-    print("\n" + "=" * 80, flush=True)
-    print("ALL TEST PREDICTIONS GENERATED & SAVED SUCCESSFULLY!", flush=True)
-    print(f"Total S1 Records Processed: {total_processed:,}", flush=True)
-    print(f"Total Candidate Pairs:      {total_candidates:,}", flush=True)
-    print(f"Total Matches Predicted:     {total_matches:,}", flush=True)
-    print(f"Files written:\n  1. {OUTPUT_MATCHING}\n  2. {OUTPUT_CANDIDATE}", flush=True)
-    print("=" * 80, flush=True)
+    assigned_cids = set()
+    final_matches = defaultdict(list)
 
-    # ----------------------------------------------------
-    # PHASE 5: OFFICIAL SUBMISSION VALIDATION
-    # ----------------------------------------------------
-    print("\n[STAGE 4/4] Running Official validate_submission.py Verification...", flush=True)
-    cmd = [
-        sys.executable,
-        str(VALIDATE_SCRIPT),
-        "--matching", str(OUTPUT_MATCHING),
-        "--candidate", str(OUTPUT_CANDIDATE),
-        "--test-dir", str(TEST_DIR)
-    ]
-    res = subprocess.run(cmd, capture_output=True, text=True)
-    print("Validator Output:\n" + res.stdout, flush=True)
-    if res.stderr:
-        print("Validator Stderr:\n" + res.stderr, flush=True)
+    for prob, sid, cid in all_pairs:
+        if cid not in assigned_cids:
+            assigned_cids.add(cid)
+            final_matches[sid].append(cid)
 
-    print(f"\nCOMPLETE PIPELINE FINISHED IN {(time.time() - t_start)/60:.1f} MINUTES!", flush=True)
+    # Write matching_results.tsv preserving exact order of TEST_S1
+    with open(OUTPUT_MATCHING, 'w', encoding='utf-8') as match_f:
+        match_f.write("source1_entity_id\tmatched_entity_ids\n")
+        non_empty = 0
+        singletons = 0
+        for sid in s1_all_ids:
+            m_list = final_matches.get(sid, [])
+            if m_list:
+                match_f.write(f"{sid}\t{','.join(m_list)}\n")
+                non_empty += 1
+            else:
+                match_f.write(f"{sid}\t\n")
+                singletons += 1
 
+    print(f"Inference Complete in {time.time()-t0:.1f}s!")
+    print(f"Total Rows: {len(s1_all_ids):,}")
+    print(f"Entities with Matches: {non_empty:,} ({non_empty/len(s1_all_ids)*100:.2f}%)")
+    print(f"Singletons: {singletons:,} ({singletons/len(s1_all_ids)*100:.2f}%)")
 
-if __name__ == "__main__":
-    run_complete_sota_pipeline()
+if __name__ == '__main__':
+    clf = train_high_precision_model()
+    run_sota_test_pipeline(clf, high_th=0.68)
