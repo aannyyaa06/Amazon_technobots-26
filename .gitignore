@@ -1,0 +1,9 @@
+﻿dataset/
+output/
+*.tsv
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.DS_Store
+models/*.pkl
+models/*.txt
