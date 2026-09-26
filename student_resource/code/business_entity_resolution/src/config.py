@@ -37,8 +37,36 @@ TEST_SOURCE_FILES = {
 SOURCE_COLUMNS = ("entity_id", "business_name", "business_address", "country")
 GROUND_TRUTH_COLUMNS = ("source1_entity_id", "matched_entity_ids")
 
+CACHE_DIR = OUTPUT_DIR / "cache"
+REPORTS_DIR = OUTPUT_DIR / "reports"
+
 # Streaming chunk size for large TSVs (laptop-safe).
 TSV_CHUNKSIZE = 50_000
+
+# Blocking: skip keys whose inverted list exceeds this (too common).
+MAX_POSTING = 180
+# Hard cap after cheap ranking — this is the set fed to LightGBM.
+MAX_CANDIDATES = 80
+NEGATIVES_PER_ENTITY = 6
+VAL_FRACTION = 0.20
+
+# LightGBM
+LGBM_PARAMS = {
+    "objective": "binary",
+    "metric": "binary_logloss",
+    "learning_rate": 0.05,
+    "num_leaves": 63,
+    "min_child_samples": 40,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "n_estimators": 250,
+    "n_jobs": -1,
+    "random_state": SEED,
+    "is_unbalance": True,
+    "verbose": -1,
+}
+
+THRESHOLDS = [round(x * 0.05, 2) for x in range(6, 20)]  # 0.30 .. 0.95
 
 EXPECTED_ID_PREFIX = {
     "source1": "S1-",
